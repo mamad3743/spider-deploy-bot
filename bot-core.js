@@ -194,9 +194,11 @@ const kvJson = async (env, key) => {
   return v ? JSON.parse(v) : null;
 };
 const kvSet = (env, key, val) => env.BOT_KV.put(key, JSON.stringify(val));
+const kvDel = (env, key) => env.BOT_KV.delete(key);
 
 const cfgKey = (chatId) => `cfg:${chatId}`;
 const projKey = (chatId, id) => `proj:${chatId}:${id}`;
+const userKey = (chatId) => `user:${chatId}`;
 
 async function getConfig(env, chatId) {
   return (await kvJson(env, cfgKey(chatId))) || {};
@@ -216,6 +218,13 @@ async function listProjects(env, chatId) {
     if (p) out.push(p);
   }
   return out;
+}
+
+// یک بار در روز به‌ازای هر کاربر یک نوشتن — برای آمار مالک (📊 Stats)
+async function trackUser(env, chatId) {
+  const key = userKey(chatId);
+  const existing = await env.BOT_KV.get(key);
+  if (!existing) await kvSet(env, key, { firstSeen: Date.now() });
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +250,7 @@ async function handleMessage(msg, env) {
   }
 
   if (text === "/start") {
+    await trackUser(env, chatId);
     return sendMessage(env, chatId, mainMenuText(), mainMenuKeyboard(chatId, env));
   }
   if (text === "/cancel") {
@@ -249,8 +259,9 @@ async function handleMessage(msg, env) {
 
   const state = decodeState(msg.reply_to_message?.text);
   if (state) {
-    if (state.step.startsWith("clone_") && !isOwner(chatId, env)) {
-      return sendMessage(env, chatId, "🚫 قابلیت Clone فقط برای مالک رباته.");
+    const ownerOnlyStep = state.step.startsWith("clone_") || state.step === "broadcast_await_text";
+    if (ownerOnlyStep && !isOwner(chatId, env)) {
+      return sendMessage(env, chatId, "🚫 این قابلیت فقط برای مالک رباته.");
     }
     return handleStepInput(chatId, text, state.step, state.data || {}, env);
   }
@@ -282,8 +293,14 @@ async function handleCallback(cb, env) {
 
   await answerCallback(env, cb.id);
 
-  if ((data === "advanced:clone" || data.startsWith("clone:")) && !isOwner(chatId, env)) {
-    return editMessage(env, chatId, messageId, "🚫 قابلیت Clone فقط برای مالک رباته.", backKeyboard());
+  if (
+    (data === "advanced:clone" ||
+      data.startsWith("clone:") ||
+      data === "advanced:stats" ||
+      data === "advanced:broadcast") &&
+    !isOwner(chatId, env)
+  ) {
+    return editMessage(env, chatId, messageId, "🚫 این قابلیت فقط برای مالک رباته.", backKeyboard());
   }
 
   try {
@@ -304,10 +321,17 @@ async function handleCallback(cb, env) {
     if (data.startsWith("deploy:panel:")) return askDeployPort(chatId, messageId, data.split(":")[2], env);
     if (data.startsWith("update:now:")) return updateProjectNow(chatId, messageId, data.split(":")[2], env);
     if (data.startsWith("update:toggle:")) return toggleAutoUpdate(chatId, messageId, data.split(":")[2], env);
+    if (data.startsWith("restart:")) return restartProject(chatId, messageId, data.split(":")[1], env);
+    if (data.startsWith("delete:ask:")) return askDeleteProject(chatId, messageId, data.split(":")[2], env);
+    if (data.startsWith("delete:confirm:")) return deleteProject(chatId, messageId, data.split(":")[2], env);
+    if (data.startsWith("qr:")) return sendProjectQr(chatId, data.split(":")[1], env);
+    if (data.startsWith("domain:custom:")) return askCustomDomain(chatId, data.split(":")[2], env);
 
     if (data === "advanced:clone") return startClone(chatId, env);
     if (data === "clone:platform:cf") return startCloneCf(chatId, env);
     if (data === "clone:platform:railway") return startCloneRailway(chatId, env);
+    if (data === "advanced:stats") return showStats(chatId, messageId, env);
+    if (data === "advanced:broadcast") return startBroadcast(chatId, env);
 
     return editMessage(env, chatId, messageId, mainMenuText(), mainMenuKeyboard(chatId, env));
   } catch (err) {
@@ -339,7 +363,11 @@ function advancedText() {
 }
 function advancedKeyboard(chatId, env) {
   const kb = [];
-  if (isOwner(chatId, env)) kb.push([{ text: "🧬 Clone Bot (تکثیر ربات)", callback_data: "advanced:clone" }]);
+  if (isOwner(chatId, env)) {
+    kb.push([{ text: "🧬 Clone Bot (تکثیر ربات)", callback_data: "advanced:clone" }]);
+    kb.push([{ text: "📊 Stats", callback_data: "advanced:stats" }]);
+    kb.push([{ text: "📣 Broadcast", callback_data: "advanced:broadcast" }]);
+  }
   kb.push([{ text: "⬅️ Back", callback_data: "menu:main" }]);
   return kb;
 }
@@ -408,6 +436,18 @@ async function handleStepInput(chatId, text, step, data, env) {
       return sendPrompt(env, chatId, "پورت نامعتبره، یک عدد بین 1 تا 65535 بفرست:", "tcp_await_port", data);
     }
     return runTcpProxy(chatId, data.projectId, port, data.isChange, env);
+  }
+
+  if (step === "domain_await_custom") {
+    const domain = text.trim().toLowerCase();
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) {
+      return sendPrompt(env, chatId, "دامنه معتبر به نظر نمیاد، یه‌بار دیگه بفرست (مثلاً panel.example.com):", "domain_await_custom", data);
+    }
+    return runCustomDomain(chatId, data.projectId, domain, env);
+  }
+
+  if (step === "broadcast_await_text") {
+    return runBroadcast(chatId, text, env);
   }
 
   if (step.startsWith("clone_cf_")) return handleCloneCfInput(chatId, text, step, data, env);
@@ -533,6 +573,7 @@ async function runNewDeploy(chatId, port, panelId, env) {
       (panel.note ? `\n${panel.note}\n` : "") +
       `\nهمین الان وارد بشو و تنظیمات اولیه رو انجام بده.`;
     const kb = [
+      [{ text: "📱 QR ورود به پنل", callback_data: `qr:${project.id}` }],
       [{ text: "🔗 TCP Proxy بساز", callback_data: `tcp:create:${project.id}` }],
       [{ text: "📁 My Projects", callback_data: "menu:projects" }],
       [{ text: "⬅️ Back", callback_data: "menu:main" }],
@@ -571,10 +612,125 @@ async function showProjectDetail(chatId, messageId, projectId, env) {
     [{ text: "🔁 Change TCP Proxy", callback_data: `tcp:change:${p.id}` }],
     [{ text: "🔄 Update Now", callback_data: `update:now:${p.id}` }],
     [{ text: p.autoUpdate ? "🟢 Auto-Update: روشن" : "⚪️ Auto-Update: خاموش", callback_data: `update:toggle:${p.id}` }],
+    [{ text: "♻️ Restart", callback_data: `restart:${p.id}` }],
+    [{ text: "📱 QR ورود به پنل", callback_data: `qr:${p.id}` }],
+    [{ text: "🌐 دامنه‌ی اختصاصی", callback_data: `domain:custom:${p.id}` }],
+    [{ text: "🗑 Delete Project", callback_data: `delete:ask:${p.id}` }],
     [{ text: "📁 My Projects", callback_data: "menu:projects" }],
     [{ text: "⬅️ Back", callback_data: "menu:main" }],
   ];
   return editMessage(env, chatId, messageId, text, kb);
+}
+
+// ---------------------------------------------------------------------------
+// ♻️ Restart / 🗑 Delete
+// ---------------------------------------------------------------------------
+async function restartProject(chatId, messageId, projectId, env) {
+  const cfg = await getConfig(env, chatId);
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return editMessage(env, chatId, messageId, "پروژه پیدا نشد.", backKeyboard());
+  try {
+    await railway(
+      cfg.railway_token,
+      `mutation($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }`,
+      { serviceId: p.serviceId, environmentId: p.environmentId }
+    );
+    return editMessage(env, chatId, messageId, `♻️ <b>${p.name}</b> ری‌استارت شد.`, [
+      [{ text: "📦 پروژه", callback_data: `proj:${p.id}` }],
+      [{ text: "⬅️ Back", callback_data: "menu:main" }],
+    ]);
+  } catch (err) {
+    return editMessage(env, chatId, messageId, `❌ ری‌استارت fail شد: ${escapeHtml(String(err.message || err))}`, backKeyboard());
+  }
+}
+
+async function askDeleteProject(chatId, messageId, projectId, env) {
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return editMessage(env, chatId, messageId, "پروژه پیدا نشد.", backKeyboard());
+  return editMessage(
+    env,
+    chatId,
+    messageId,
+    `⚠️ <b>مطمئنی می‌خوای «${p.name}» رو پاک کنی؟</b>\n\nاین کار کل پروژه رو از Railway هم حذف می‌کنه و برگشت‌ناپذیره.`,
+    [
+      [{ text: "🗑 بله، پاک کن", callback_data: `delete:confirm:${p.id}` }],
+      [{ text: "❌ نه، بیخیال", callback_data: `proj:${p.id}` }],
+    ]
+  );
+}
+
+async function deleteProject(chatId, messageId, projectId, env) {
+  const cfg = await getConfig(env, chatId);
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return editMessage(env, chatId, messageId, "پروژه پیدا نشد.", backKeyboard());
+  try {
+    await railway(cfg.railway_token, `mutation($id: String!) { projectDelete(id: $id) }`, { id: p.id });
+    await kvDel(env, projKey(chatId, projectId));
+    return editMessage(env, chatId, messageId, `🗑 پروژه‌ی <b>${p.name}</b> پاک شد.`, [[{ text: "📁 My Projects", callback_data: "menu:projects" }], [{ text: "⬅️ Back", callback_data: "menu:main" }]]);
+  } catch (err) {
+    return editMessage(env, chatId, messageId, `❌ حذف fail شد: ${escapeHtml(String(err.message || err))}`, backKeyboard());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 📱 QR ورود به پنل
+// ---------------------------------------------------------------------------
+// توجه: این QR فقط برای «آدرس ورود به پنل» هست، نه یک لینک اشتراک VLESS
+// آماده — چون تولید کانفیگ واقعی (UUID و...) داخل خودِ پنل انجام میشه، نه
+// از طریق این بات دیپلوی.
+async function sendProjectQr(chatId, projectId, env) {
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return sendMessage(env, chatId, "پروژه پیدا نشد.", backKeyboard());
+  const loginUrl = `https://${p.customDomain || p.domain}`;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(loginUrl)}`;
+  return tgCall(env, "sendPhoto", {
+    chat_id: chatId,
+    photo: qrUrl,
+    caption: `📱 QR ورود به «${p.name}»\n<code>${loginUrl}</code>`,
+    parse_mode: "HTML",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 🌐 دامنه‌ی اختصاصی
+// ---------------------------------------------------------------------------
+async function askCustomDomain(chatId, projectId, env) {
+  return sendPrompt(
+    env,
+    chatId,
+    "🌐 <b>دامنه‌ی اختصاصی</b>\n\nدامنه‌ای که خودت مالکشی رو بفرست (مثلاً panel.example.com). بعدش باید یک رکورد CNAME به آدرسی که بهت میدم اضافه کنی:",
+    "domain_await_custom",
+    { projectId }
+  );
+}
+
+async function runCustomDomain(chatId, projectId, domain, env) {
+  const cfg = await getConfig(env, chatId);
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return sendMessage(env, chatId, "پروژه پیدا نشد.", backKeyboard());
+  try {
+    const data = await railway(
+      cfg.railway_token,
+      `mutation($input: CustomDomainCreateInput!) { customDomainCreate(input: $input) { id domain status { dnsRecords { hostlabel recordType requiredValue } verificationToken } } }`,
+      { input: { domain, environmentId: p.environmentId, serviceId: p.serviceId } }
+    );
+    const cd = data.customDomainCreate;
+    p.customDomain = cd.domain;
+    await kvSet(env, projKey(chatId, projectId), p);
+
+    const records = (cd.status?.dnsRecords || [])
+      .map((r) => `  • ${r.recordType} ${r.hostlabel || "@"} → <code>${r.requiredValue}</code>`)
+      .join("\n");
+    const text =
+      `🌐 <b>دامنه‌ی اختصاصی اضافه شد</b>\n\nحالا این رکوردها رو توی DNS دامنه‌ت ست کن:\n\n${records || "(از داشبورد Railway چک کن)"}\n` +
+      (cd.status?.verificationToken
+        ? `\n📌 رکورد TXT هم لازمه با مقدار:\n<code>${cd.status.verificationToken}</code>\n`
+        : "") +
+      `\nبعد از تنظیم DNS، چند دقیقه صبر کن تا verify بشه.`;
+    return sendMessage(env, chatId, text, [[{ text: "📦 پروژه", callback_data: `proj:${p.id}` }], [{ text: "⬅️ Back", callback_data: "menu:main" }]]);
+  } catch (err) {
+    return sendMessage(env, chatId, `❌ خطا: ${escapeHtml(String(err.message || err))}`, backKeyboard());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +829,50 @@ async function showSpace(chatId, messageId, env) {
   } catch (err) {
     return editMessage(env, chatId, messageId, `❌ ${escapeHtml(String(err.message || err))}`, backKeyboard());
   }
+}
+
+// ---------------------------------------------------------------------------
+// 📊 Stats + 📣 Broadcast (فقط مالک)
+// ---------------------------------------------------------------------------
+async function showStats(chatId, messageId, env) {
+  const [{ keys: userKeys }, { keys: projKeys }, { keys: cfgKeys }] = await Promise.all([
+    env.BOT_KV.list({ prefix: "user:" }),
+    env.BOT_KV.list({ prefix: "proj:" }),
+    env.BOT_KV.list({ prefix: "cfg:" }),
+  ]);
+  let autoUpdateCount = 0;
+  for (const k of projKeys) {
+    const p = await kvJson(env, k.name);
+    if (p?.autoUpdate) autoUpdateCount++;
+  }
+  const text =
+    `📊 <b>Stats</b>\n\n` +
+    `👥 کل کاربرهایی که /start زدن: ${userKeys.length}\n` +
+    `🔗 اکانت‌های Railway/Cloudflare وصل‌شده: ${cfgKeys.length}\n` +
+    `📦 پروژه‌های ساخته‌شده (همه‌ی کاربرها): ${projKeys.length}\n` +
+    `🔄 پروژه‌های با Auto-Update روشن: ${autoUpdateCount}`;
+  return editMessage(env, chatId, messageId, text, backKeyboard());
+}
+
+async function startBroadcast(chatId, env) {
+  return sendPrompt(env, chatId, "📣 <b>Broadcast</b>\n\nمتنی که می‌خوای برای همه‌ی کسایی که بات رو استارت کردن ارسال بشه رو بفرست:", "broadcast_await_text");
+}
+
+async function runBroadcast(chatId, text, env) {
+  const { keys } = await env.BOT_KV.list({ prefix: "user:" });
+  let sent = 0;
+  let failed = 0;
+  for (const k of keys) {
+    const uid = k.name.split(":")[1];
+    try {
+      const r = await sendMessage(env, uid, text);
+      if (r.ok) sent++;
+      else failed++;
+    } catch {
+      failed++;
+    }
+  }
+  return sendMessage(env, chatId, `📣 Broadcast ارسال شد.\n✅ موفق: ${sent}\n❌ ناموفق (بلاک/حذف‌شده): ${failed}`, backKeyboard());
 }
 
 // ---------------------------------------------------------------------------
