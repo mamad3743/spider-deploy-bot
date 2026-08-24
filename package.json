@@ -1,0 +1,13 @@
+{
+  "name": "spider-deploy-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Spider Deploy Bot — Telegram deploy bot core, runnable on Cloudflare Workers or Railway (Node.js)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

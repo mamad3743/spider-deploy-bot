@@ -6,14 +6,18 @@ compatibility_date = "2026-08-01"
 #   wrangler kv namespace create BOT_KV
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "REPLACE_WITH_KV_ID"
+id = "0fe2cdb6686c4d8f8b322cf2e239dab2"
 
-# متغیرهای متنی (غیرمحرمانه). این‌ها باید به مسیر همین ریپو/فایل اشاره کنن
-# تا قابلیت «Clone Bot» بتونه سورس رو از GitHub بخونه.
+# اجرای دوره‌ای برای Auto-Update پنل‌ها — هر روز ساعت ۰۳:۰۰ UTC
+[triggers]
+crons = ["0 3 * * *"]
+
+# متغیرهای متنی (غیرمحرمانه). SOURCE_REPO باید به همون ریپو/برنچی اشاره کنه
+# که bot-core.js و worker.js توش هستن (برای قابلیت Clone Bot).
 [vars]
-SOURCE_REPO = "mamad3743/spider-deploy-bot"
+SOURCE_REPO = "YOUR_GITHUB_USERNAME/spider-deploy-bot"
 SOURCE_BRANCH = "main"
-SOURCE_FILE = "worker.js"
+# REQUIRED_CHANNELS = "@yourchannel,@yourgroup"   # اختیاری — عضویت اجباری
 
 # این‌ها secret هستن، با wrangler ست کن (پایین README رو ببین):
 #   BOT_TOKEN
