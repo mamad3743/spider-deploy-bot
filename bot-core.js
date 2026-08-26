@@ -56,11 +56,50 @@ const PANELS = [
       "🔑 ورود اول: <code>/managepanel/</code> با یوزر/پس پیش‌فرض <code>admin/admin</code> — حتماً بلافاصله عوضش کن.\n" +
       "⚙️ موقع ساخت Inbound توی پنل: Protocol=VLESS, Listen Port=<code>8080</code> (ثابت), Network=ws, Security=none.",
   },
+  {
+    id: "marzban",
+    name: "🛂 Marzban",
+    repo: "x4gKing/Marzban-Panel",
+    // این ریپو موقع build سورس رسمی Gozargah/Marzban رو کلون می‌کنه؛
+    // پورت رو Railway خودش از $PORT تزریق می‌کنه، نیازی به پرسیدن نیست.
+    promptPort: false,
+    buildVars() {
+      return { SUDO_USERNAME: "admin_" + randomToken(2), SUDO_PASSWORD: randomToken(8) };
+    },
+    note:
+      "🔑 با یوزر/پسی که بالا نشون داده شد وارد <code>/dashboard/</code> شو.\n" +
+      "💾 دیتابیس پیش‌فرض SQLite — اگه کاربر زیاد داری، از پلاگین Postgres خودِ Railway و متغیر SQLALCHEMY_DATABASE_URL استفاده کن.",
+  },
+  {
+    id: "heimdall",
+    name: "🌩️ Heimdall (3x-ui بهبودیافته)",
+    repo: "x4gKing/3x-ui-Upgrade",
+    // مثل 3xui: nginx پنل+VLESS رو از یک پورت رد می‌کنه، پورت داخلی ثابت 8080.
+    promptPort: false,
+    buildVars() {
+      return {};
+    },
+    note:
+      "🔑 ورود اول: <code>/managepanel/</code> با یوزر/پس پیش‌فرض <code>admin/admin</code> — حتماً عوضش کن.\n" +
+      "⚙️ Inbound: Listen Port=<code>8080</code> (ثابت).\n" +
+      "💾 برای اینکه دیتا با هر Redeploy پاک نشه، از بخش Volumes یک Volume به مسیر <code>/etc/x-ui</code> وصل کن.",
+  },
   // 👉 پنل بعدی رو اینجا اضافه کن
 ];
 
 function findPanel(id) {
   return PANELS.find((p) => p.id === id);
+}
+
+// 🌍 Regionهای واقعی Railway (از docs.railway.com/deployments/regions)
+const REGIONS = [
+  { id: "europe-west4-drams3a", name: "🇳🇱 EU West (Amsterdam)" },
+  { id: "us-west2", name: "🇺🇸 US West (California)" },
+  { id: "us-east4-eqdc4a", name: "🇺🇸 US East (Virginia)" },
+  { id: "asia-southeast1-eqsg3a", name: "🇸🇬 Southeast Asia (Singapore)" },
+];
+function findRegion(id) {
+  return REGIONS.find((r) => r.id === id);
 }
 
 // state مراحلِ فرم با تگ base64 قابل‌دیدن حمل میشه (نه zero-width — تلگرام
@@ -259,6 +298,9 @@ async function handleMessage(msg, env) {
 
   const state = decodeState(msg.reply_to_message?.text);
   if (state) {
+    if (state.step === "restore_await_file") {
+      return handleRestoreUpload(chatId, msg, env);
+    }
     const ownerOnlyStep = state.step.startsWith("clone_") || state.step === "broadcast_await_text";
     if (ownerOnlyStep && !isOwner(chatId, env)) {
       return sendMessage(env, chatId, "🚫 این قابلیت فقط برای مالک رباته.");
@@ -318,7 +360,11 @@ async function handleCallback(cb, env) {
     if (data.startsWith("proj:")) return showProjectDetail(chatId, messageId, data.split(":")[1], env);
     if (data.startsWith("tcp:create:")) return askTcpPort(chatId, data.split(":")[2], false, env);
     if (data.startsWith("tcp:change:")) return askTcpPort(chatId, data.split(":")[2], true, env);
-    if (data.startsWith("deploy:panel:")) return askDeployPort(chatId, messageId, data.split(":")[2], env);
+    if (data.startsWith("deploy:panel:")) return askDeployRegion(chatId, messageId, data.split(":")[2], env);
+    if (data.startsWith("deploy:region:")) {
+      const [, , panelId, regionId] = data.split(":");
+      return askDeployPort(chatId, messageId, panelId, regionId, env);
+    }
     if (data.startsWith("update:now:")) return updateProjectNow(chatId, messageId, data.split(":")[2], env);
     if (data.startsWith("update:toggle:")) return toggleAutoUpdate(chatId, messageId, data.split(":")[2], env);
     if (data.startsWith("restart:")) return restartProject(chatId, messageId, data.split(":")[1], env);
@@ -326,6 +372,10 @@ async function handleCallback(cb, env) {
     if (data.startsWith("delete:confirm:")) return deleteProject(chatId, messageId, data.split(":")[2], env);
     if (data.startsWith("qr:")) return sendProjectQr(chatId, data.split(":")[1], env);
     if (data.startsWith("domain:custom:")) return askCustomDomain(chatId, data.split(":")[2], env);
+    if (data.startsWith("rename:")) return askRenameProject(chatId, data.split(":")[1], env);
+    if (data.startsWith("backup:")) return sendProjectBackup(chatId, data.split(":")[1], env);
+    if (data === "account:backup_all") return sendAllBackup(chatId, env);
+    if (data === "account:restore") return askRestoreBackup(chatId, env);
 
     if (data === "advanced:clone") return startClone(chatId, env);
     if (data === "clone:platform:cf") return startCloneCf(chatId, env);
@@ -386,6 +436,8 @@ async function showAccount(chatId, messageId, env) {
   const kb = [
     [{ text: cfg.railway_token ? "🔁 Reconnect Railway" : "🚂 Connect Railway", callback_data: "account:connect_railway" }],
     [{ text: cfg.cf_token ? "🔁 Reconnect Cloudflare" : "☁️ Connect Cloudflare", callback_data: "account:connect_cf" }],
+    [{ text: "💾 Backup All Projects", callback_data: "account:backup_all" }],
+    [{ text: "📥 Restore Backup", callback_data: "account:restore" }],
     [{ text: "🗑 Delete Railway Account", callback_data: "account:delete_railway" }],
     [{ text: "⬅️ Back", callback_data: "menu:main" }],
   ];
@@ -427,7 +479,7 @@ async function handleStepInput(chatId, text, step, data, env) {
     if (!port || port < 1 || port > 65535) {
       return sendPrompt(env, chatId, "پورت نامعتبره، یک عدد بین 1 تا 65535 بفرست:", "new_deploy_await_port", data);
     }
-    return runNewDeploy(chatId, port, data.panelId, env);
+    return runNewDeploy(chatId, port, data.panelId, data.regionId, env);
   }
 
   if (step === "tcp_await_port") {
@@ -444,6 +496,14 @@ async function handleStepInput(chatId, text, step, data, env) {
       return sendPrompt(env, chatId, "دامنه معتبر به نظر نمیاد، یه‌بار دیگه بفرست (مثلاً panel.example.com):", "domain_await_custom", data);
     }
     return runCustomDomain(chatId, data.projectId, domain, env);
+  }
+
+  if (step === "rename_await_name") {
+    const newName = text.trim().slice(0, 64);
+    if (!newName) {
+      return sendPrompt(env, chatId, "اسم خالیه، یه اسم بفرست:", "rename_await_name", data);
+    }
+    return runRenameProject(chatId, data.projectId, newName, env);
   }
 
   if (step === "broadcast_await_text") {
@@ -488,13 +548,21 @@ async function startNewDeploy(chatId, messageId, env) {
   return editMessage(env, chatId, messageId, "🆕 <b>New Deployment</b>\n\nکدوم پنل رو می‌خوای دیپلوی کنی؟", kb);
 }
 
-async function askDeployPort(chatId, messageId, panelId, env) {
+async function askDeployRegion(chatId, messageId, panelId, env) {
+  const panel = findPanel(panelId);
+  if (!panel) return editMessage(env, chatId, messageId, "پنل پیدا نشد.", backKeyboard());
+  const kb = REGIONS.map((r) => [{ text: r.name, callback_data: `deploy:region:${panelId}:${r.id}` }]);
+  kb.push([{ text: "⬅️ Back", callback_data: "menu:new_deploy" }]);
+  return editMessage(env, chatId, messageId, `🌍 <b>${panel.name}</b>\n\nکدوم Region؟ (هرچی به کاربرهات نزدیک‌تر باشه، تاخیر کمتره)`, kb);
+}
+
+async function askDeployPort(chatId, messageId, panelId, regionId, env) {
   const panel = findPanel(panelId);
   if (!panel) return editMessage(env, chatId, messageId, "پنل پیدا نشد.", backKeyboard());
 
   if (panel.promptPort === false) {
     await editMessage(env, chatId, messageId, `🖥️ <b>${panel.name}</b>\n\nدر حال دیپلوی، پورت این پنل خودکاره...`, null);
-    return runNewDeploy(chatId, null, panelId, env);
+    return runNewDeploy(chatId, null, panelId, regionId, env);
   }
 
   await editMessage(env, chatId, messageId, `🖥️ <b>${panel.name}</b>\n\nدر حال آماده‌سازی...`, null);
@@ -503,13 +571,14 @@ async function askDeployPort(chatId, messageId, panelId, env) {
     chatId,
     `🖥️ <b>Create Service — ${panel.name}</b>\n\nاول سرویس رو می‌سازیم و دامنه‌ش رو می‌گیریم. اگه بعداً برای Reality/VLESS به TCP Proxy نیاز داشتی، از داخل پروژه جداگونه می‌تونی بسازیش.\n\nپورت داخلی سرویس رو بفرست (مثلاً 8080):`,
     "new_deploy_await_port",
-    { panelId }
+    { panelId, regionId }
   );
 }
 
-async function runNewDeploy(chatId, port, panelId, env) {
+async function runNewDeploy(chatId, port, panelId, regionId, env) {
   const panel = findPanel(panelId);
   if (!panel) return sendMessage(env, chatId, "پنل پیدا نشد، دوباره از منو امتحان کن.", backKeyboard());
+  const region = findRegion(regionId);
   const cfg = await getConfig(env, chatId);
   const progress = await sendMessage(env, chatId, "🚀 در حال دیپلوی...\n▱▱▱▱▱▱▱▱▱▱ 0%");
   const messageId = progress.result.message_id;
@@ -522,7 +591,7 @@ async function runNewDeploy(chatId, port, panelId, env) {
     );
     const project = projData.projectCreate;
     const environmentId = project.environments.edges[0].node.id;
-    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▱▱▱▱▱▱▱▱ 20% (پروژه ساخته شد)");
+    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▱▱▱▱▱▱▱▱▱ 15% (پروژه ساخته شد)");
 
     const variables = panel.buildVars(port);
     const svcData = await railway(
@@ -531,14 +600,27 @@ async function runNewDeploy(chatId, port, panelId, env) {
       { input: { projectId: project.id, name: panel.id, source: { repo: panel.repo }, variables } }
     );
     const service = svcData.serviceCreate;
-    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▰▰▱▱▱▱▱▱ 40% (سرویس از GitHub ساخته شد)");
+    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▱▱▱▱▱▱▱▱ 30% (سرویس از GitHub ساخته شد)");
+
+    if (region) {
+      try {
+        await railway(
+          cfg.railway_token,
+          `mutation($serviceId: String!, $environmentId: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input) }`,
+          { serviceId: service.id, environmentId, input: { multiRegionConfig: { [region.id]: { numReplicas: 1 } } } }
+        );
+      } catch {
+        // اگه ست‌کردن region fail بشه، دیپلوی رو با region پیش‌فرض Railway ادامه میدیم
+      }
+    }
+    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▰▱▱▱▱▱▱▱ 45% (Region تنظیم شد)");
 
     await railway(
       cfg.railway_token,
       `mutation($serviceId: String!, $environmentId: String!) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId) }`,
       { serviceId: service.id, environmentId }
     );
-    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▰▰▰▰▱▱▱▱ 60% (دیپلوی شروع شد)");
+    await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▰▰▰▱▱▱▱▱ 60% (دیپلوی شروع شد)");
 
     const domData = await railway(
       cfg.railway_token,
@@ -548,6 +630,9 @@ async function runNewDeploy(chatId, port, panelId, env) {
     const domain = domData.serviceDomainCreate.domain;
     await editMessage(env, chatId, messageId, "🚀 در حال دیپلوی...\n▰▰▰▰▰▰▰▰▰▰ 100% ✅");
 
+    const adminUser = variables.SUDO_USERNAME || variables.XUI_USERNAME || null;
+    const adminPassword = variables.ADMIN_PASSWORD || variables.SUDO_PASSWORD || variables.XUI_PASSWORD || null;
+
     const proj = {
       id: project.id,
       name: project.name,
@@ -556,7 +641,10 @@ async function runNewDeploy(chatId, port, panelId, env) {
       serviceId: service.id,
       environmentId,
       domain,
-      adminPassword: variables.ADMIN_PASSWORD || null,
+      region: region?.id || null,
+      regionName: region?.name || null,
+      adminUser,
+      adminPassword,
       port,
       createdAt: Date.now(),
       autoUpdate: false,
@@ -568,6 +656,8 @@ async function runNewDeploy(chatId, port, panelId, env) {
       `📦 <b>${panel.name} Deployment</b>\n` +
       `Deployment completed ✅\n\n` +
       `🌐 Domain: <code>${domain}</code>\n` +
+      (region ? `🌍 Region: ${region.name}\n` : "") +
+      (proj.adminUser ? `👤 Admin User: <code>${proj.adminUser}</code>\n` : "") +
       (proj.adminPassword ? `🔑 Admin Password: <code>${proj.adminPassword}</code>\n` : "") +
       (port ? `🎯 Internal Port: <code>${port}</code>\n` : "") +
       (panel.note ? `\n${panel.note}\n` : "") +
@@ -602,7 +692,9 @@ async function showProjectDetail(chatId, messageId, projectId, env) {
   const proxies = (p.tcpProxies || []).map((t) => `  • ${t.domain}:${t.proxyPort} → :${t.applicationPort}`).join("\n") || "  (هیچ)";
   const text =
     `📦 <b>${p.name}</b> (${p.panelName || p.panelId || "?"})\n\n` +
-    `🌐 Domain: <code>${p.domain}</code>\n` +
+    `🌐 Domain: <code>${p.customDomain || p.domain}</code>\n` +
+    (p.region ? `🌍 Region: ${p.regionName || p.region}\n` : "") +
+    (p.adminUser ? `👤 Admin User: <code>${p.adminUser}</code>\n` : "") +
     (p.adminPassword ? `🔑 Admin Password: <code>${p.adminPassword}</code>\n\n` : "\n") +
     (panel?.note ? `${panel.note}\n\n` : "") +
     `🔌 TCP Proxies:\n${proxies}` +
@@ -615,6 +707,8 @@ async function showProjectDetail(chatId, messageId, projectId, env) {
     [{ text: "♻️ Restart", callback_data: `restart:${p.id}` }],
     [{ text: "📱 QR ورود به پنل", callback_data: `qr:${p.id}` }],
     [{ text: "🌐 دامنه‌ی اختصاصی", callback_data: `domain:custom:${p.id}` }],
+    [{ text: "✏️ Rename", callback_data: `rename:${p.id}` }],
+    [{ text: "💾 Backup", callback_data: `backup:${p.id}` }],
     [{ text: "🗑 Delete Project", callback_data: `delete:ask:${p.id}` }],
     [{ text: "📁 My Projects", callback_data: "menu:projects" }],
     [{ text: "⬅️ Back", callback_data: "menu:main" }],
@@ -669,6 +763,89 @@ async function deleteProject(chatId, messageId, projectId, env) {
     return editMessage(env, chatId, messageId, `🗑 پروژه‌ی <b>${p.name}</b> پاک شد.`, [[{ text: "📁 My Projects", callback_data: "menu:projects" }], [{ text: "⬅️ Back", callback_data: "menu:main" }]]);
   } catch (err) {
     return editMessage(env, chatId, messageId, `❌ حذف fail شد: ${escapeHtml(String(err.message || err))}`, backKeyboard());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ✏️ Rename project
+// ---------------------------------------------------------------------------
+async function askRenameProject(chatId, projectId, env) {
+  return sendPrompt(env, chatId, "✏️ اسم جدید پروژه رو بفرست:", "rename_await_name", { projectId });
+}
+
+async function runRenameProject(chatId, projectId, newName, env) {
+  const cfg = await getConfig(env, chatId);
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return sendMessage(env, chatId, "پروژه پیدا نشد.", backKeyboard());
+  try {
+    // تغییر اسم روی Railway اختیاریه — اگه schema فرق داشت یا fail شد،
+    // فقط اسم محلی (توی این بات) آپدیت میشه که چیزی خراب نشه.
+    await railway(cfg.railway_token, `mutation($id: String!, $input: ProjectUpdateInput!) { projectUpdate(id: $id, input: $input) { id } }`, {
+      id: p.id,
+      input: { name: newName },
+    });
+  } catch {}
+  p.name = newName;
+  await kvSet(env, projKey(chatId, projectId), p);
+  return sendMessage(env, chatId, `✏️ اسم پروژه به «${newName}» تغییر کرد.`, [
+    [{ text: "📦 پروژه", callback_data: `proj:${p.id}` }],
+    [{ text: "⬅️ Back", callback_data: "menu:main" }],
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// 💾 Backup / 📥 Restore
+// ---------------------------------------------------------------------------
+async function sendBackupFile(env, chatId, data, filename, caption) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", caption);
+  form.append("document", blob, filename);
+  const res = await fetch(tg(env, "sendDocument"), { method: "POST", body: form });
+  return res.json();
+}
+
+async function sendProjectBackup(chatId, projectId, env) {
+  const p = await kvJson(env, projKey(chatId, projectId));
+  if (!p) return sendMessage(env, chatId, "پروژه پیدا نشد.", backKeyboard());
+  return sendBackupFile(env, chatId, [p], `${p.panelId || "project"}-${p.id}.json`, "💾 بکاپ این پروژه — شامل توکن/پسورد پنله، جای امن نگه‌دار.");
+}
+
+async function sendAllBackup(chatId, env) {
+  const projects = await listProjects(env, chatId);
+  if (!projects.length) return sendMessage(env, chatId, "پروژه‌ای برای بکاپ نداری.", backKeyboard());
+  return sendBackupFile(env, chatId, projects, `spider-bot-backup-${Date.now()}.json`, `💾 بکاپ همه‌ی پروژه‌ها (${projects.length} پروژه) — جای امن نگه‌دار.`);
+}
+
+async function askRestoreBackup(chatId, env) {
+  return sendPrompt(env, chatId, "📥 فایل بکاپ (JSON) رو به همین پیام ریپلای کن و بفرست:", "restore_await_file");
+}
+
+async function handleRestoreUpload(chatId, msg, env) {
+  if (!msg.document) {
+    return sendMessage(env, chatId, "باید فایل JSON بکاپ رو به‌عنوان Document بفرستی (نه متن ساده).", backKeyboard());
+  }
+  try {
+    const fileInfo = await tgCall(env, "getFile", { file_id: msg.document.file_id });
+    if (!fileInfo.ok) throw new Error("نتونستم فایل رو از تلگرام بگیرم.");
+    const fileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.result.file_path}`;
+    const res = await fetch(fileUrl);
+    const json = await res.json();
+    const projects = Array.isArray(json) ? json : [json];
+    let restored = 0;
+    for (const p of projects) {
+      if (!p || !p.id) continue;
+      await kvSet(env, projKey(chatId, p.id), p);
+      restored++;
+    }
+    if (!restored) throw new Error("هیچ پروژه‌ی معتبری توی فایل پیدا نشد.");
+    return sendMessage(env, chatId, `✅ ${restored} پروژه از بکاپ بازگردانده شد.\n\nتوجه: این فقط رکورد داخل بات رو برمی‌گردونه؛ اگه خودِ پروژه روی Railway پاک شده باشه، برنمی‌گرده.`, [
+      [{ text: "📁 My Projects", callback_data: "menu:projects" }],
+      [{ text: "⬅️ Back", callback_data: "menu:main" }],
+    ]);
+  } catch (err) {
+    return sendMessage(env, chatId, `❌ فایل بکاپ نامعتبره: ${escapeHtml(String(err.message || err))}`, backKeyboard());
   }
 }
 
